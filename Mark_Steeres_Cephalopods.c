@@ -253,7 +253,6 @@ int main(){
     }
     
     printf("%d\n", finalSum & MOD_MASK);
-    
     free(nextStates);
     StateArray_free(&curr);
     StateArray_free(&next);
