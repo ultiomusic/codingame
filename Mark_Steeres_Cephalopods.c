@@ -1,577 +1,464 @@
-/*
- * Optimized Cephalopods Game Simulation Challenge
- *
- * This version is tuned for extreme speed on all test cases (from a few thousand
- * up to 316712 unique states), with a target runtime of about 0–2 ms per test.
- *
- * Game rules: Two players add dice to a 3x3 grid. On a move, a die is placed with:
- *   - a value of 1 if no capturing is possible,
- *   - or, if adjacent to two or more dice where some combination sums to <=6,
- *     the combination is captured and its sum becomes the new die value.
- * Once the board is full (or when the maximum depth is reached), the board is hashed.
- *
- * Scoring: Each board state is mapped to a 32‐bit hash.
- * The final answer is the sum of these hashes modulo 2^30.
- *
- * The code uses precomputed move tables (one per board cell), inline assembly to
- * compute keys quickly, and a custom radix sort/merge for state deduplication.
- */
+#undef _GLIBCXX_DEBUG
+#pragma GCC optimize ("Ofast,unroll-loops,omit-frame-pointer,inline")
+#pragma GCC option("arch=native", "tune=native", "no-zero-upper")
+#pragma GCC target("movbe,aes,pclmul,avx,avx2,f16c,fma,sse3,ssse3,sse4.1,sse4.2,rdrnd,popcnt,bmi,bmi2,lzcnt")
 
- #include <stdio.h>
- #include <stdlib.h>
- #include <stdint.h>
- #include <stdbool.h>
- #include <string.h>
- 
- // ---------------------------------------------------------------------------
- // Configuration & Global Constants
- // ---------------------------------------------------------------------------
- #define MOD       (1 << 30)
- #define MOD_MASK  (MOD - 1)
- #define STATE_CAP (1 << 21)  // Maximum states allocated
- #define RADIX1    (1 << 14)
- #define RADIX2    (1 << 13)
- 
- // Precomputed powers-of-10 for board hash (left-to-right, top-to-bottom).
- static const uint32_t pow10_arr[9] = {
-     100000000, 10000000, 1000000, 100000, 10000, 1000, 100, 10, 1
- };
- 
- // Each board cell is stored in 3 bits at fixed shifts.
- static const int cellShift[9] = { 0, 3, 6, 9, 12, 15, 18, 21, 24 };
- static const uint32_t cellMask[9] = {
-     7U << 0, 7U << 3, 7U << 6, 7U << 9, 7U << 12,
-     7U << 15, 7U << 18, 7U << 21, 7U << 24
- };
- 
- // Precomputed cell hash contributions: cell value * its power-of-10.
- uint32_t cell_hash_contrib[9][7];
- 
- // ---------------------------------------------------------------------------
- // State Structure & Global Arrays
- // ---------------------------------------------------------------------------
- typedef struct {
-     uint32_t packed;   // Packed board representation (9 cells × 3 bits)
-     int cnt;           // Count of ways to reach this state
- } State;
- 
- State *curr;  // Current states array
- State *next;  // Next states array
- State *aux;   // Auxiliary array for radix sorting
- 
- // ---------------------------------------------------------------------------
- // Fixed Board Geometry
- // ---------------------------------------------------------------------------
- static const int cellNeighborCount[9] = { 2, 3, 2, 3, 4, 3, 2, 3, 2 };
- static const int cellNeighbors[9][4] = {
-     { 1, 3, -1, -1 },
-     { 0, 2, 4, -1 },
-     { 1, 5, -1, -1 },
-     { 0, 4, 6, -1 },
-     { 1, 3, 5, 7 },
-     { 2, 4, 8, -1 },
-     { 3, 7, -1, -1 },
-     { 4, 6, 8, -1 },
-     { 5, 7, -1, -1 }
- };
- 
- // ---------------------------------------------------------------------------
- // Table-Driven Move Expansion Structures
- // ---------------------------------------------------------------------------
- typedef struct {
-    int count;         // Number of moves for this key
-    int moves[12];     // New die value (capture sum)
-    int masks[12];     // Bitmask of captured neighbors (indices in the cellNeighbors order)
- } Moves;
- 
- Moves *moveTable[9] = { 0 };
- 
- // Helper: Compute integer power (base^exp)
- static inline int ipow(int base, int exp) __attribute__((always_inline));
- static inline int ipow(int base, int exp) {
-     int r = 1;
-     while(exp--) r *= base;
-     return r;
- }
- 
- // Precompute move table for a single board cell.
- void init_move_table_for_cell(int cell) {
-     int n = cellNeighborCount[cell];
-     int table_size = ipow(7, n);
-     moveTable[cell] = (Moves *)malloc(table_size * sizeof(Moves));
-     if (!moveTable[cell]) { perror("malloc failed"); exit(1); }
-     for (int key = 0; key < table_size; key++) {
-         int temp = key;
-         int vals[4] = {0, 0, 0, 0};
-         int filled = 0;
-         for (int j = 0; j < n; j++) {
-             vals[j] = temp % 7;
-             temp /= 7;
-             if (vals[j] != 0)
-                 filled++;
-         }
-         Moves *entry = &moveTable[cell][key];
-         if (filled < 2) {
-             entry->count = 1;
-             entry->moves[0] = 1;   // Default non-capturing move
-             entry->masks[0] = 0;
-         } else {
-             int moveCount = 0;
-             int subset_limit = 1 << n;
-             for (int s = 0; s < subset_limit; s++) {
-                 bool valid = true;
-                 int popc = 0, sum = 0;
-                 for (int j = 0; j < n; j++) {
-                     if (s & (1 << j)) {
-                         if (vals[j] == 0) { valid = false; break; }
-                         popc++;
-                         sum += vals[j];
-                     }
-                 }
-                 if (!valid || popc < 2)
-                     continue;
-                 if (sum <= 6) {
-                     entry->moves[moveCount] = sum;
-                     entry->masks[moveCount] = s;
-                     moveCount++;
-                 }
-             }
-             if (moveCount == 0) {
-                 entry->count = 1;
-                 entry->moves[0] = 1;
-                 entry->masks[0] = 0;
-             } else {
-                 entry->count = moveCount;
-             }
-         }
-     }
- }
- 
- // Initialize move tables for all nine cells.
- void init_move_tables() {
-     for (int cell = 0; cell < 9; cell++) {
-         init_move_table_for_cell(cell);
-     }
- }
- 
- // Free move tables.
- void free_move_tables() {
-     for (int cell = 0; cell < 9; cell++) {
-         free(moveTable[cell]);
-     }
- }
- 
- // ---------------------------------------------------------------------------
- // Radix Sort & Merge (State Deduplication)
- // ---------------------------------------------------------------------------
- static inline void radix_sort_states(State *arr, State *aux, int n) __attribute__((always_inline));
- static inline void radix_sort_states(State *arr, State *aux, int n) {
-     int count[RADIX1] = {0};
-     for (int i = 0; i < n; i++)
-         count[arr[i].packed & (RADIX1 - 1)]++;
-     for (int i = 1; i < RADIX1; i++)
-         count[i] += count[i - 1];
-     for (int i = n - 1; i >= 0; i--)
-         aux[--count[arr[i].packed & (RADIX1 - 1)]] = arr[i];
-     memset(count, 0, sizeof(count));
-     for (int i = 0; i < n; i++)
-         count[(aux[i].packed >> 14) & (RADIX2 - 1)]++;
-     for (int i = 1; i < RADIX2; i++)
-         count[i] += count[i - 1];
-     for (int i = n - 1; i >= 0; i--)
-         arr[--count[(aux[i].packed >> 14) & (RADIX2 - 1)]] = aux[i];
- }
- 
- static inline int merge_states(State *arr, int n) __attribute__((always_inline));
- static inline int merge_states(State *arr, int n) {
-     if(n == 0) return 0;
-     int out = 0;
-     for (int i = 1; i < n; i++) {
-         if(arr[i].packed == arr[out].packed)
-             arr[out].cnt = (arr[out].cnt + arr[i].cnt) & MOD_MASK;
-         else
-             arr[++out] = arr[i];
-     }
-     return out + 1;
- }
- 
- // ---------------------------------------------------------------------------
- // Table-Driven Cell Expansion Macros with Inline Assembly
- // Each macro tests if a cell is empty then computes a key from its neighbors
- // (using inline assembly to speed up the multiplications and shifts) and
- // produces all applicable new states.
- // ---------------------------------------------------------------------------
- #define PROCESS_CELL_TABLE_0(board, ways, nextArray, nextCount) {           \
-     if (((board >> 0) & 7) == 0) {                                          \
-         int k;                                                            \
-         __asm__ volatile (                                                \
-             "movl %1, %%eax\n\t"                                          \
-             "shr $3, %%eax\n\t"                                             \
-             "and $7, %%eax\n\t"                                             \
-             "movl %1, %%ebx\n\t"                                            \
-             "shr $9, %%ebx\n\t"                                             \
-             "and $7, %%ebx\n\t"                                             \
-             "imul $7, %%ebx\n\t"                                             \
-             "add %%ebx, %%eax\n\t"                                            \
-             "movl %%eax, %0\n\t"                                             \
-             : "=r"(k)                                                       \
-             : "r"(board)                                                    \
-             : "eax", "ebx" );                                                \
-         Moves *entry = &moveTable[0][k];                                    \
-         for (int m = 0; m < entry->count; m++) {                            \
-             uint32_t nb = board;                                            \
-             if (entry->masks[m] & 1) nb &= ~(0x7U << 3);                      \
-             if (entry->masks[m] & 2) nb &= ~(0x7U << 9);                      \
-             nb |= ((uint32_t)entry->moves[m]) << 0;                           \
-             (nextArray)[(*nextCount)++] = (State){ nb, ways };              \
-         }                                                                   \
-     }                                                                       \
- }
- 
- #define PROCESS_CELL_TABLE_1(board, ways, nextArray, nextCount) {           \
-     if (((board >> 3) & 7) == 0) {                                          \
-         int k;                                                            \
-         __asm__ volatile (                                                \
-             "movl %1, %%eax\n\t"                                          \
-             "shr $0, %%eax\n\t"                                             \
-             "and $7, %%eax\n\t"                                             \
-             "movl %1, %%ebx\n\t"                                            \
-             "shr $6, %%ebx\n\t"                                             \
-             "and $7, %%ebx\n\t"                                             \
-             "imul $7, %%ebx\n\t"                                             \
-             "movl %1, %%ecx\n\t"                                            \
-             "shr $12, %%ecx\n\t"                                            \
-             "and $7, %%ecx\n\t"                                             \
-             "imul $49, %%ecx\n\t"                                           \
-             "add %%eax, %%ecx\n\t"                                          \
-             "add %%ebx, %%ecx\n\t"                                          \
-             "movl %%ecx, %0\n\t"                                             \
-             : "=r"(k)                                                       \
-             : "r"(board)                                                    \
-             : "eax", "ebx", "ecx" );                                          \
-         Moves *entry = &moveTable[1][k];                                    \
-         for (int m = 0; m < entry->count; m++) {                            \
-             uint32_t nb = board;                                            \
-             if (entry->masks[m] & 1) nb &= ~(0x7U << 0);                      \
-             if (entry->masks[m] & 2) nb &= ~(0x7U << 6);                      \
-             if (entry->masks[m] & 4) nb &= ~(0x7U << 12);                     \
-             nb |= ((uint32_t)entry->moves[m]) << 3;                           \
-             (nextArray)[(*nextCount)++] = (State){ nb, ways };              \
-         }                                                                   \
-     }                                                                       \
- }
- 
- #define PROCESS_CELL_TABLE_2(board, ways, nextArray, nextCount) {           \
-     if (((board >> 6) & 7) == 0) {                                          \
-         int k;                                                            \
-         __asm__ volatile (                                                \
-             "movl %1, %%eax\n\t"                                          \
-             "shr $3, %%eax\n\t"                                             \
-             "and $7, %%eax\n\t"                                             \
-             "movl %1, %%ebx\n\t"                                            \
-             "shr $15, %%ebx\n\t"                                            \
-             "and $7, %%ebx\n\t"                                             \
-             "imul $7, %%ebx\n\t"                                             \
-             "add %%ebx, %%eax\n\t"                                            \
-             "movl %%eax, %0\n\t"                                             \
-             : "=r"(k)                                                       \
-             : "r"(board)                                                    \
-             : "eax", "ebx" );                                                \
-         Moves *entry = &moveTable[2][k];                                    \
-         for (int m = 0; m < entry->count; m++) {                            \
-             uint32_t nb = board;                                            \
-             if (entry->masks[m] & 1) nb &= ~(0x7U << 3);                      \
-             if (entry->masks[m] & 2) nb &= ~(0x7U << 15);                     \
-             nb |= ((uint32_t)entry->moves[m]) << 6;                           \
-             (nextArray)[(*nextCount)++] = (State){ nb, ways };              \
-         }                                                                   \
-     }                                                                       \
- }
- 
- #define PROCESS_CELL_TABLE_3(board, ways, nextArray, nextCount) {           \
-     if (((board >> 9) & 7) == 0) {                                          \
-         int k;                                                            \
-         __asm__ volatile (                                                \
-             "movl %1, %%eax\n\t"                                          \
-             "shr $0, %%eax\n\t"                                             \
-             "and $7, %%eax\n\t"                                             \
-             "movl %1, %%ebx\n\t"                                            \
-             "shr $12, %%ebx\n\t"                                            \
-             "and $7, %%ebx\n\t"                                             \
-             "imul $7, %%ebx\n\t"                                             \
-             "movl %1, %%ecx\n\t"                                            \
-             "shr $18, %%ecx\n\t"                                            \
-             "and $7, %%ecx\n\t"                                             \
-             "imul $49, %%ecx\n\t"                                           \
-             "add %%eax, %%ecx\n\t"                                          \
-             "add %%ebx, %%ecx\n\t"                                          \
-             "movl %%ecx, %0\n\t"                                             \
-             : "=r"(k)                                                       \
-             : "r"(board)                                                    \
-             : "eax", "ebx", "ecx" );                                          \
-         Moves *entry = &moveTable[3][k];                                    \
-         for (int m = 0; m < entry->count; m++) {                            \
-             uint32_t nb = board;                                            \
-             if (entry->masks[m] & 1) nb &= ~(0x7U << 0);                      \
-             if (entry->masks[m] & 2) nb &= ~(0x7U << 12);                     \
-             if (entry->masks[m] & 4) nb &= ~(0x7U << 18);                     \
-             nb |= ((uint32_t)entry->moves[m]) << 9;                           \
-             (nextArray)[(*nextCount)++] = (State){ nb, ways };              \
-         }                                                                   \
-     }                                                                       \
- }
- 
- #define PROCESS_CELL_TABLE_4(board, ways, nextArray, nextCount) {           \
-     if (((board >> 12) & 7) == 0) {                                         \
-         int k;                                                            \
-         __asm__ volatile (                                                \
-             "movl %1, %%eax\n\t"                                          \
-             "shr $3, %%eax\n\t"                                             \
-             "and $7, %%eax\n\t"                                             \
-             "movl %1, %%ebx\n\t"                                            \
-             "shr $9, %%ebx\n\t"                                             \
-             "and $7, %%ebx\n\t"                                             \
-             "imul $7, %%ebx\n\t"                                             \
-             "movl %1, %%ecx\n\t"                                            \
-             "shr $15, %%ecx\n\t"                                             \
-             "and $7, %%ecx\n\t"                                             \
-             "imul $49, %%ecx\n\t"                                           \
-             "movl %1, %%edx\n\t"                                            \
-             "shr $21, %%edx\n\t"                                             \
-             "and $7, %%edx\n\t"                                             \
-             "imul $343, %%edx\n\t"                                          \
-             "add %%eax, %%edx;\n\t"                                          \
-             "add %%ebx, %%edx;\n\t"                                          \
-             "add %%ecx, %%edx;\n\t"                                          \
-             "movl %%edx, %0\n\t"                                             \
-             : "=r"(k)                                                       \
-             : "r"(board)                                                    \
-             : "eax", "ebx", "ecx", "edx" );                                  \
-         Moves *entry = &moveTable[4][k];                                    \
-         for (int m = 0; m < entry->count; m++) {                            \
-             uint32_t nb = board;                                            \
-             if (entry->masks[m] & 1) nb &= ~(0x7U << 3);                      \
-             if (entry->masks[m] & 2) nb &= ~(0x7U << 9);                      \
-             if (entry->masks[m] & 4) nb &= ~(0x7U << 15);                     \
-             if (entry->masks[m] & 8) nb &= ~(0x7U << 21);                     \
-             nb |= ((uint32_t)entry->moves[m]) << 12;                          \
-             (nextArray)[(*nextCount)++] = (State){ nb, ways };              \
-         }                                                                   \
-     }                                                                       \
- }
- 
- #define PROCESS_CELL_TABLE_5(board, ways, nextArray, nextCount) {           \
-     if (((board >> 15) & 7) == 0) {                                         \
-         int k;                                                            \
-         __asm__ volatile (                                                \
-             "movl %1, %%eax\n\t"                                          \
-             "shr $6, %%eax\n\t"                                             \
-             "and $7, %%eax\n\t"                                             \
-             "movl %1, %%ebx\n\t"                                            \
-             "shr $12, %%ebx\n\t"                                            \
-             "and $7, %%ebx\n\t"                                             \
-             "imul $7, %%ebx\n\t"                                             \
-             "add %%ebx, %%eax\n\t"                                            \
-             "movl %%eax, %0\n\t"                                             \
-             : "=r"(k)                                                       \
-             : "r"(board)                                                    \
-             : "eax", "ebx" );                                                \
-         k += (((board >> 24) & 7) * 49);                                     \
-         Moves *entry = &moveTable[5][k];                                    \
-         for (int m = 0; m < entry->count; m++) {                            \
-             uint32_t nb = board;                                            \
-             if (entry->masks[m] & 1) nb &= ~(0x7U << 6);                      \
-             if (entry->masks[m] & 2) nb &= ~(0x7U << 12);                     \
-             if (entry->masks[m] & 4) nb &= ~(0x7U << 24);                     \
-             nb |= ((uint32_t)entry->moves[m]) << 15;                          \
-             (nextArray)[(*nextCount)++] = (State){ nb, ways };              \
-         }                                                                   \
-     }                                                                       \
- }
- 
- #define PROCESS_CELL_TABLE_6(board, ways, nextArray, nextCount) {           \
-     if (((board >> 18) & 7) == 0) {                                         \
-         int k;                                                            \
-         __asm__ volatile (                                                \
-             "movl %1, %%eax\n\t"                                          \
-             "shr $9, %%eax\n\t"                                             \
-             "and $7, %%eax\n\t"                                             \
-             "movl %1, %%ebx\n\t"                                            \
-             "shr $21, %%ebx\n\t"                                             \
-             "and $7, %%ebx\n\t"                                             \
-             "imul $7, %%ebx\n\t"                                             \
-             "add %%ebx, %%eax\n\t"                                            \
-             "movl %%eax, %0\n\t"                                             \
-             : "=r"(k)                                                       \
-             : "r"(board)                                                    \
-             : "eax", "ebx" );                                                \
-         Moves *entry = &moveTable[6][k];                                    \
-         for (int m = 0; m < entry->count; m++) {                            \
-             uint32_t nb = board;                                            \
-             if (entry->masks[m] & 1) nb &= ~(0x7U << 9);                      \
-             if (entry->masks[m] & 2) nb &= ~(0x7U << 21);                     \
-             nb |= ((uint32_t)entry->moves[m]) << 18;                          \
-             (nextArray)[(*nextCount)++] = (State){ nb, ways };              \
-         }                                                                   \
-     }                                                                       \
- }
- 
- #define PROCESS_CELL_TABLE_7(board, ways, nextArray, nextCount) {           \
-     if (((board >> 21) & 7) == 0) {                                         \
-         int k;                                                            \
-         __asm__ volatile (                                                \
-             "movl %1, %%eax\n\t"                                          \
-             "shr $12, %%eax\n\t"                                            \
-             "and $7, %%eax\n\t"                                             \
-             "movl %1, %%ebx\n\t"                                            \
-             "shr $18, %%ebx\n\t"                                             \
-             "and $7, %%ebx\n\t"                                             \
-             "imul $7, %%ebx\n\t"                                             \
-             "movl %1, %%ecx\n\t"                                            \
-             "shr $24, %%ecx\n\t"                                             \
-             "and $7, %%ecx\n\t"                                             \
-             "imul $49, %%ecx\n\t"                                           \
-             "add %%eax, %%ecx\n\t"                                          \
-             "add %%ebx, %%ecx\n\t"                                          \
-             "movl %%ecx, %0\n\t"                                             \
-             : "=r"(k)                                                       \
-             : "r"(board)                                                    \
-             : "eax", "ebx", "ecx" );                                          \
-         Moves *entry = &moveTable[7][k];                                    \
-         for (int m = 0; m < entry->count; m++) {                            \
-             uint32_t nb = board;                                            \
-             if (entry->masks[m] & 1) nb &= ~(0x7U << 12);                     \
-             if (entry->masks[m] & 2) nb &= ~(0x7U << 18);                     \
-             if (entry->masks[m] & 4) nb &= ~(0x7U << 24);                     \
-             nb |= ((uint32_t)entry->moves[m]) << 21;                          \
-             (nextArray)[(*nextCount)++] = (State){ nb, ways };              \
-         }                                                                   \
-     }                                                                       \
- }
- 
- #define PROCESS_CELL_TABLE_8(board, ways, nextArray, nextCount) {           \
-     if (((board >> 24) & 7) == 0) {                                         \
-         int k;                                                            \
-         __asm__ volatile (                                                \
-             "movl %1, %%eax\n\t"                                          \
-             "shr $15, %%eax\n\t"                                            \
-             "and $7, %%eax\n\t"                                             \
-             "movl %1, %%ebx\n\t"                                            \
-             "shr $21, %%ebx\n\t"                                             \
-             "and $7, %%ebx\n\t"                                             \
-             "imul $7, %%ebx\n\t"                                             \
-             "add %%ebx, %%eax\n\t"                                            \
-             "movl %%eax, %0\n\t"                                             \
-             : "=r"(k)                                                       \
-             : "r"(board)                                                    \
-             : "eax", "ebx" );                                                \
-         Moves *entry = &moveTable[8][k];                                    \
-         for (int m = 0; m < entry->count; m++) {                            \
-             uint32_t nb = board;                                            \
-             if (entry->masks[m] & 1) nb &= ~(0x7U << 15);                     \
-             if (entry->masks[m] & 2) nb &= ~(0x7U << 21);                     \
-             nb |= ((uint32_t)entry->moves[m]) << 24;                          \
-             (nextArray)[(*nextCount)++] = (State){ nb, ways };              \
-         }                                                                   \
-     }                                                                       \
- }
- 
- // ---------------------------------------------------------------------------
- // Board Hash Calculation (Always Inlined)
- // ---------------------------------------------------------------------------
- static inline uint32_t compute_board_hash(uint32_t board) __attribute__((always_inline));
- static inline uint32_t compute_board_hash(uint32_t board) {
-     return ( cell_hash_contrib[0][ (board >> 0) & 7 ] +
-              cell_hash_contrib[1][ (board >> 3) & 7 ] +
-              cell_hash_contrib[2][ (board >> 6) & 7 ] +
-              cell_hash_contrib[3][ (board >> 9) & 7 ] +
-              cell_hash_contrib[4][ (board >> 12) & 7 ] +
-              cell_hash_contrib[5][ (board >> 15) & 7 ] +
-              cell_hash_contrib[6][ (board >> 18) & 7 ] +
-              cell_hash_contrib[7][ (board >> 21) & 7 ] +
-              cell_hash_contrib[8][ (board >> 24) & 7 ] ) & MOD_MASK;
- }
- 
- static inline bool board_is_full(uint32_t board) __attribute__((always_inline));
- static inline bool board_is_full(uint32_t board) {
-     return ((board & cellMask[0]) &&
-             (board & cellMask[1]) &&
-             (board & cellMask[2]) &&
-             (board & cellMask[3]) &&
-             (board & cellMask[4]) &&
-             (board & cellMask[5]) &&
-             (board & cellMask[6]) &&
-             (board & cellMask[7]) &&
-             (board & cellMask[8]));
- }
- 
- // ---------------------------------------------------------------------------
- // Main Simulation Loop
- // ---------------------------------------------------------------------------
- int main(){
-     int depth;
-     if (scanf("%d", &depth) != 1)
-         return 1;
-     uint32_t init = 0;
-     int val;
-     for (int pos = 0; pos < 9; pos++){
-         if (scanf("%d", &val) != 1)
-             return 1;
-         init |= ((uint32_t)(val & 7)) << cellShift[pos];
-     }
-     // Precompute cell hash contributions.
-     for (int pos = 0; pos < 9; pos++){
-         for (int v = 0; v < 7; v++){
-             cell_hash_contrib[pos][v] = v * pow10_arr[pos];
-         }
-     }
-     // Initialize move tables.
-     init_move_tables();
-     
-     uint32_t finalSum = 0;
-     int curr_size = 1;
-     curr = (State*)malloc(STATE_CAP * sizeof(State));
-     next = (State*)malloc(STATE_CAP * sizeof(State));
-     aux  = (State*)malloc(STATE_CAP * sizeof(State));
-     if (!curr || !next || !aux) {
-         perror("malloc failure");
-         exit(1);
-     }
-     curr[0].packed = init;
-     curr[0].cnt = 1;
-     
-     for (int move = 0; move <= depth; move++){
-         int nextCount = 0;
-         State *curPtr = curr;
-         for (int i = 0; i < curr_size; i++){
-             uint32_t board = curPtr->packed;
-             int ways = curPtr->cnt;
-             curPtr++;
-             if (__builtin_expect(board_is_full(board) || move == depth, 0)) {
-                 finalSum = (finalSum + (uint64_t)compute_board_hash(board) * ways) & MOD_MASK;
-                 continue;
-             }
-             PROCESS_CELL_TABLE_0(board, ways, next, &nextCount);
-             PROCESS_CELL_TABLE_1(board, ways, next, &nextCount);
-             PROCESS_CELL_TABLE_2(board, ways, next, &nextCount);
-             PROCESS_CELL_TABLE_3(board, ways, next, &nextCount);
-             PROCESS_CELL_TABLE_4(board, ways, next, &nextCount);
-             PROCESS_CELL_TABLE_5(board, ways, next, &nextCount);
-             PROCESS_CELL_TABLE_6(board, ways, next, &nextCount);
-             PROCESS_CELL_TABLE_7(board, ways, next, &nextCount);
-             PROCESS_CELL_TABLE_8(board, ways, next, &nextCount);
-         }
-         radix_sort_states(next, aux, nextCount);
-         nextCount = merge_states(next, nextCount);
-         memcpy(curr, next, nextCount * sizeof(State));
-         curr_size = nextCount;
-     }
-     
-     printf("%d\n", finalSum & MOD_MASK);
-     free(curr);
-     free(next);
-     free(aux);
-     free_move_tables();
-     return 0;
- }
- 
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef uint32_t State;
+typedef uint32_t Count;
+typedef Count CountArray[8];
+
+#define GET_DIE_VALUE(state, position) (((state) >> ((position) * 3)) & 7)
+#define CLEAR_DIE_VALUE(state, position) ((state) & ~(7 << ((position) * 3)))
+#define SET_DIE_VALUE(state, position, value) ((state) | ((value) << ((position) * 3)))
+#define IS_POSITION_EMPTY(state, position) ((((state) >> ((position) * 3)) & 7) == 0)
+
+static inline void print_state(const State state) {
+    int i, j;
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            int die_value = GET_DIE_VALUE(state, i * 3 + j);
+            printf("%d ", die_value);
+        }
+        printf("\n");
+    }
+    printf("\n");
+}
+
+static inline int state_hash(const State state) {
+    int state_hash_val = 0;
+    int i;
+    for (i = 0; i < 9; i++) {
+        state_hash_val = state_hash_val * 10 + GET_DIE_VALUE(state, i);
+    }
+    return state_hash_val;
+}
+
+// Precomputed tables
+
+static const State neighbors_mask[9] = {
+    0b000000000000000111000111000,  // 0
+    0b000000000000111000111000111,  // 1
+    0b000000000111000000000111000,  // 2
+    0b000000111000111000000000111,  // 3
+    0b000111000111000111000111000,  // 4
+    0b111000000000111000111000000,  // 5
+    0b000111000000000111000000000,  // 6
+    0b111000111000111000000000000,  // 7
+    0b000111000111000000000000000   // 8
+};
+
+static const uint8_t symmetric_mult[64] = {
+    0, 1, 2, 3, 4, 5, 6, 7,
+    1, 0, 3, 2, 6, 7, 4, 5,
+    2, 3, 0, 1, 5, 4, 7, 6,
+    3, 2, 1, 0, 7, 6, 5, 4,
+    4, 5, 6, 7, 0, 1, 2, 3,
+    5, 4, 7, 6, 2, 3, 0, 1,
+    6, 7, 4, 5, 1, 0, 3, 2,
+    7, 6, 5, 4, 3, 2, 1, 0
+};
+
+static const uint64_t MOD = 1ULL << 30;
+
+// Masks for positions (using 3 bits per cell)
+#define MASK_0  (0x7)
+#define MASK_1  (0x7 << 3)
+#define MASK_2  (0x7 << 6)
+#define MASK_3  (0x7 << 9)
+#define MASK_4  (0x7 << 12)
+#define MASK_5  (0x7 << 15)
+#define MASK_6  (0x7 << 18)
+#define MASK_7  (0x7 << 21)
+#define MASK_8  (0x7 << 24)
+
+// Inline assembly functions for popcount and count-trailing-zeros
+
+static inline int asm_popcnt(uint32_t x) {
+    int r;
+    __asm__("popcnt %1, %0" : "=r"(r) : "r"(x));
+    return r;
+}
+
+static inline int asm_ctz(uint32_t x) {
+    int r;
+    __asm__("bsf %1, %0" : "=r"(r) : "r"(x));
+    return r;
+}
+
+// Hash Table Implementation
+
+typedef struct {
+    uint32_t max_size;
+    uint32_t * __restrict keys;
+    uint64_t * __restrict table; // Lower 32 bits: state; Upper 32 bits: storage index
+    size_t count;
+    uint32_t * __restrict storage;  // Flat array storing Count values (groups of 8 per entry)
+    uint32_t storage_capacity;
+    uint32_t next_storage_index;
+} HashTable;
+
+static inline void init_hash_table(HashTable *ht) {
+    // Use a power-of-two size for faster modulo operation.
+    ht->max_size = 1 << 17;  // 131072 elements
+    ht->keys = (uint32_t *)malloc(ht->max_size * sizeof(uint32_t));
+    ht->table = (uint64_t *)malloc(ht->max_size * sizeof(uint64_t));
+    memset(ht->table, 0, ht->max_size * sizeof(uint64_t));
+    ht->count = 0;
+    ht->storage_capacity = ht->max_size * 8;
+    ht->storage = (uint32_t *)malloc(ht->storage_capacity * sizeof(uint32_t));
+    ht->next_storage_index = 0;
+}
+
+static inline void free_hash_table(HashTable *ht) {
+    free(ht->keys);
+    free(ht->table);
+    free(ht->storage);
+}
+
+static inline uint32_t get_next_storage_index(HashTable *ht) {
+    if (ht->next_storage_index + 8 > ht->storage_capacity) {
+        ht->storage_capacity *= 2;
+        uint32_t *new_storage = (uint32_t *)malloc(ht->storage_capacity * sizeof(uint32_t));
+        memcpy(new_storage, ht->storage, ht->next_storage_index * sizeof(uint32_t));
+        free(ht->storage);
+        ht->storage = new_storage;
+    }
+    uint32_t index = ht->next_storage_index;
+    ht->next_storage_index += 8;
+    return index;
+}
+
+static inline void hash_table_insert(HashTable *ht, const State new_state, const CountArray value) {
+    if (ht->count >= ht->max_size) {
+        fprintf(stderr, "Hash table is full\n");
+        exit(1);
+    }
+    // Use bitwise AND for modulo (max_size is a power of two)
+    uint32_t hash = new_state & (ht->max_size - 1);
+    while (ht->table[hash] != 0) {
+        uint64_t pair = ht->table[hash];
+        State state = (State)(pair & 0xFFFFFFFF);
+        if (state == new_state) {
+            uint32_t index = (pair >> 32) & 0xFFFFFFFF;
+            for (int j = 0; j < 8; j++) {
+                ht->storage[index + j] += value[j];
+            }
+            return;
+        }
+        hash = (hash + 1) & (ht->max_size - 1);
+    }
+    ht->keys[ht->count] = hash;
+    uint32_t storage_index = get_next_storage_index(ht);
+    memcpy(ht->storage + storage_index, value, 8 * sizeof(Count));
+    ht->table[hash] = ((uint64_t)new_state) | (((uint64_t)storage_index) << 32);
+    ht->count++;
+}
+
+static inline void clear_hash_table(HashTable *ht) {
+    memset(ht->table, 0, ht->max_size * sizeof(uint64_t));
+    ht->count = 0;
+    ht->next_storage_index = 0;
+}
+
+static inline void swap_hash_table(HashTable *a, HashTable *b) {
+    uint32_t *temp_keys = a->keys;
+    a->keys = b->keys;
+    b->keys = temp_keys;
+
+    uint64_t *temp_table = a->table;
+    a->table = b->table;
+    b->table = temp_table;
+
+    uint32_t *temp_storage = a->storage;
+    a->storage = b->storage;
+    b->storage = temp_storage;
+
+    size_t temp_count = a->count;
+    a->count = b->count;
+    b->count = temp_count;
+
+    uint32_t temp_capacity = a->storage_capacity;
+    a->storage_capacity = b->storage_capacity;
+    b->storage_capacity = temp_capacity;
+
+    uint32_t temp_next = a->next_storage_index;
+    a->next_storage_index = b->next_storage_index;
+    b->next_storage_index = temp_next;
+}
+
+// Global variables
+
+int max_depth;
+int current_depth;
+HashTable states_to_process;
+HashTable new_states_to_process;
+uint32_t final_sum = 0;
+
+// Game state construction and symmetry operations
+
+static inline State create_state(const char *state_str) {
+    if (strlen(state_str) != 9) {
+        fprintf(stderr, "Invalid state string length\n");
+        return 0;
+    }
+    State state = 0;
+    for (int i = 0; i < 9; i++) {
+        state = SET_DIE_VALUE(state, i, state_str[i] - '0');
+    }
+    return state;
+}
+
+#define VERTCAL_FLIP(state) ( \
+        (((state) & 0b111111111000000000000000000) >> 18) | \
+        (((state) & 0b000000000000000000111111111) << 18) | \
+        ((state) & 0b000000000111111111000000000) )
+
+#define HORIZONTAL_FLIP(state) ( \
+        (((state) & 0b000000111000000111000000111) << 6) | \
+        (((state) & 0b111000000111000000111000000) >> 6) | \
+        ((state) & 0b000111000000111000000111000) )
+
+#define DIAGONAL_FLIP(state) ( \
+        ((state) & MASK_0) | \
+        (((state) & MASK_1) << 6) | \
+        (((state) & MASK_2) << 12) | \
+        (((state) & MASK_3) >> 6) | \
+        ((state) & MASK_4) | \
+        (((state) & MASK_5) << 6) | \
+        (((state) & MASK_6) >> 12) | \
+        (((state) & MASK_7) >> 6) | \
+        ((state) & MASK_8) )
+
+#define DVH_FLIP(state) ( \
+        (((state) & MASK_0) << 24) | \
+        (((state) & MASK_1) << 12) | \
+        ((state) & MASK_2) | \
+        (((state) & MASK_3) << 12) | \
+        ((state) & MASK_4) | \
+        (((state) & MASK_5) >> 12) | \
+        ((state) & MASK_6) | \
+        (((state) & MASK_7) >> 12) | \
+        (((state) & MASK_8) >> 24) )
+
+static inline State get_symmetric_state(State state, int symmetry) {
+    switch (symmetry) {
+        case 0: return state;                   // Identity
+        case 1: return VERTCAL_FLIP(state);       // Vertical flip
+        case 2: return HORIZONTAL_FLIP(state);    // Horizontal flip
+        case 3: { State v = VERTCAL_FLIP(state); return HORIZONTAL_FLIP(v); } // VH
+        case 4: return DIAGONAL_FLIP(state);      // Diagonal flip
+        case 5: { State d = DIAGONAL_FLIP(state); return VERTCAL_FLIP(d); }   // DV
+        case 6: { State d = DIAGONAL_FLIP(state); return HORIZONTAL_FLIP(d); }  // DH
+        case 7: return DVH_FLIP(state);           // DVH
+    }
+    return state;
+}
+
+static inline void add_final_state(State new_state, const Count counts[8]) {
+    for (int symmetry = 0; symmetry < 8; symmetry++) {
+        if (counts[symmetry] == 0)
+            continue;
+        State symmetric_state = get_symmetric_state(new_state, symmetry);
+        int hash = 0;
+        for (int i = 0; i < 9; i++) {
+            hash = hash * 10 + GET_DIE_VALUE(symmetric_state, i);
+        }
+        final_sum += hash * counts[symmetry];
+    }
+}
+
+// Note: The previous non-static forward declaration for insert_possible_move was removed 
+// to resolve the storage class conflict. Use the following static inline definition directly.
+
+static inline void insert_possible_move(State new_state, const Count counts[8]) {
+    State canonical_state = new_state;
+    int canonical_index = 0;
+    for (int i = 1; i < 8; i++) {
+        State symmetric_state = get_symmetric_state(new_state, i);
+        if (symmetric_state < canonical_state) {
+            canonical_index = i;
+            canonical_state = symmetric_state;
+        }
+    }
+
+    CountArray new_counts;
+    for (int symmetry = 0; symmetry < 8; symmetry++) {
+        new_counts[symmetry] = counts[symmetric_mult[canonical_index * 8 + symmetry]];
+    }
+
+    if ((current_depth == max_depth - 1) ||
+        ((canonical_state & MASK_0) && (canonical_state & MASK_1) && (canonical_state & MASK_2) &&
+         (canonical_state & MASK_3) && (canonical_state & MASK_4) && (canonical_state & MASK_5) &&
+         (canonical_state & MASK_6) && (canonical_state & MASK_7) && (canonical_state & MASK_8))) {
+        add_final_state(canonical_state, new_counts);
+    } else {
+        hash_table_insert(&new_states_to_process, canonical_state, new_counts);
+    }
+}
+
+// Compute a neighbor mask for the given position.
+static inline State get_neighbor_mask(State state, int position) {
+    State mask = state & neighbors_mask[position];
+    return ( !!(mask & 7) ) |
+           ((!!((mask >> 3) & 7)) << 1) |
+           ((!!((mask >> 6) & 7)) << 2) |
+           ((!!((mask >> 9) & 7)) << 3) |
+           ((!!((mask >> 12) & 7)) << 4) |
+           ((!!((mask >> 15) & 7)) << 5) |
+           ((!!((mask >> 18) & 7)) << 6) |
+           ((!!((mask >> 21) & 7)) << 7) |
+           ((!!((mask >> 24) & 7)) << 8);
+}
+
+// Generate all possible moves given a state and corresponding counts.
+void get_possible_moves(State state, const Count counts[8]) {
+    for (int i = 0; i < 9; i++) {
+        if (!IS_POSITION_EMPTY(state, i))
+            continue;
+        State neighbor_mask = get_neighbor_mask(state, i);
+        int neighbor_count = asm_popcnt(neighbor_mask);
+        int capture_possible = 0;
+
+        // Macros for summing two or three neighboring dice values.
+        #define two_sum(i0, n0, i1, n1)                              \
+            do {                                                   \
+                int sum = (n0) + (n1);                             \
+                if (sum <= 6) {                                  \
+                    State new_state = CLEAR_DIE_VALUE(state, (i0));\
+                    new_state = CLEAR_DIE_VALUE(new_state, (i1));  \
+                    new_state = SET_DIE_VALUE(new_state, i, sum);  \
+                    insert_possible_move(new_state, counts);       \
+                    capture_possible = 1;                          \
+                }                                                  \
+            } while (0)
+
+        #define three_sum(i0, n0, i1, n1, i2, n2)                   \
+            do {                                                   \
+                int sum = (n0) + (n1) + (n2);                      \
+                if (sum <= 6) {                                  \
+                    State new_state = CLEAR_DIE_VALUE(state, (i0));\
+                    new_state = CLEAR_DIE_VALUE(new_state, (i1));  \
+                    new_state = CLEAR_DIE_VALUE(new_state, (i2));  \
+                    new_state = SET_DIE_VALUE(new_state, i, sum);  \
+                    insert_possible_move(new_state, counts);       \
+                    capture_possible = 1;                          \
+                }                                                  \
+            } while (0)
+
+        if (neighbor_count == 2) {
+            int first_neighbor_index = asm_ctz(neighbor_mask);
+            int second_neighbor_index = asm_ctz(neighbor_mask & ~(1U << first_neighbor_index));
+            int first_die_value = GET_DIE_VALUE(state, first_neighbor_index);
+            int second_die_value = GET_DIE_VALUE(state, second_neighbor_index);
+            two_sum(first_neighbor_index, first_die_value, second_neighbor_index, second_die_value);
+        }
+        else if (neighbor_count == 3) {
+            int first_neighbor_index = asm_ctz(neighbor_mask);
+            int second_neighbor_index = asm_ctz(neighbor_mask & ~(1U << first_neighbor_index));
+            int third_neighbor_index = asm_ctz(neighbor_mask & ~(1U << first_neighbor_index) & ~(1U << second_neighbor_index));
+            int first_die_value = GET_DIE_VALUE(state, first_neighbor_index);
+            int second_die_value = GET_DIE_VALUE(state, second_neighbor_index);
+            int third_die_value = GET_DIE_VALUE(state, third_neighbor_index);
+            two_sum(first_neighbor_index, first_die_value, second_neighbor_index, second_die_value);
+            two_sum(first_neighbor_index, first_die_value, third_neighbor_index, third_die_value);
+            two_sum(second_neighbor_index, second_die_value, third_neighbor_index, third_die_value);
+            three_sum(first_neighbor_index, first_die_value, second_neighbor_index, second_die_value, third_neighbor_index, third_die_value);
+        }
+        else if (neighbor_count == 4) {
+            int first_neighbor_index = asm_ctz(neighbor_mask);
+            int second_neighbor_index = asm_ctz(neighbor_mask & ~(1U << first_neighbor_index));
+            int third_neighbor_index = asm_ctz(neighbor_mask & ~(1U << first_neighbor_index) & ~(1U << second_neighbor_index));
+            int fourth_neighbor_index = asm_ctz(neighbor_mask & ~(1U << first_neighbor_index) & ~(1U << second_neighbor_index) & ~(1U << third_neighbor_index));
+            int first_die_value = GET_DIE_VALUE(state, first_neighbor_index);
+            int second_die_value = GET_DIE_VALUE(state, second_neighbor_index);
+            int third_die_value = GET_DIE_VALUE(state, third_neighbor_index);
+            int fourth_die_value = GET_DIE_VALUE(state, fourth_neighbor_index);
+            two_sum(first_neighbor_index, first_die_value, second_neighbor_index, second_die_value);
+            two_sum(first_neighbor_index, first_die_value, third_neighbor_index, third_die_value);
+            two_sum(first_neighbor_index, first_die_value, fourth_neighbor_index, fourth_die_value);
+            two_sum(second_neighbor_index, second_die_value, third_neighbor_index, third_die_value);
+            two_sum(second_neighbor_index, second_die_value, fourth_neighbor_index, fourth_die_value);
+            two_sum(third_neighbor_index, third_die_value, fourth_neighbor_index, fourth_die_value);
+            three_sum(first_neighbor_index, first_die_value, second_neighbor_index, second_die_value, third_neighbor_index, third_die_value);
+            three_sum(first_neighbor_index, first_die_value, second_neighbor_index, second_die_value, fourth_neighbor_index, fourth_die_value);
+            three_sum(first_neighbor_index, first_die_value, third_neighbor_index, third_die_value, fourth_neighbor_index, fourth_die_value);
+            three_sum(second_neighbor_index, second_die_value, third_neighbor_index, third_die_value, fourth_neighbor_index, fourth_die_value);
+            {
+                int sum = first_die_value + second_die_value + third_die_value + fourth_die_value;
+                if (sum <= 6) {
+                    State new_state = CLEAR_DIE_VALUE(state, first_neighbor_index);
+                    new_state = CLEAR_DIE_VALUE(new_state, second_neighbor_index);
+                    new_state = CLEAR_DIE_VALUE(new_state, third_neighbor_index);
+                    new_state = CLEAR_DIE_VALUE(new_state, fourth_neighbor_index);
+                    new_state = SET_DIE_VALUE(new_state, i, sum);
+                    insert_possible_move(new_state, counts);
+                    capture_possible = 1;
+                }
+            }
+        }
+
+        if (neighbor_count < 2 || !capture_possible) {
+            insert_possible_move(SET_DIE_VALUE(state, i, 1), counts);
+        }
+
+        #undef two_sum
+        #undef three_sum
+    }
+}
+
+static inline int compute_final_sum() {
+    return final_sum % MOD;
+}
+
+// Main function
+
+int main() {
+    int i;
+    if (scanf("%d", &max_depth) != 1) {
+        fprintf(stderr, "Error reading max_depth\n");
+        return 1;
+    }
+
+    State initial_state = 0;
+    for (i = 0; i < 9; i++) {
+        unsigned int value;
+        if (scanf("%u", &value) != 1) {
+            fprintf(stderr, "Error reading initial state values\n");
+            return 1;
+        }
+        initial_state = SET_DIE_VALUE(initial_state, i, value);
+    }
+
+    CountArray initial_counts = {0};
+    initial_counts[0] = 1;
+
+    init_hash_table(&states_to_process);
+    init_hash_table(&new_states_to_process);
+    hash_table_insert(&states_to_process, initial_state, initial_counts);
+
+    for (current_depth = 0; current_depth < max_depth; current_depth++) {
+        if (states_to_process.count == 0)
+            break;
+        for (i = 0; i < (int)states_to_process.count; i++) {
+            uint32_t table_index = states_to_process.keys[i];
+            uint64_t pair = states_to_process.table[table_index];
+            State state = (State)(pair & 0xFFFFFFFF);
+            uint32_t index = (pair >> 32) & 0xFFFFFFFF;
+            const Count *counts = states_to_process.storage + index;
+            get_possible_moves(state, counts);
+        }
+        swap_hash_table(&states_to_process, &new_states_to_process);
+        clear_hash_table(&new_states_to_process);
+    }
+    int final_value = compute_final_sum();
+    printf("%d\n", final_value);
+
+    free_hash_table(&states_to_process);
+    free_hash_table(&new_states_to_process);
+    return 0;
+}
