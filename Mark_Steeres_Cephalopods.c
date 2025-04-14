@@ -38,8 +38,6 @@ static inline int state_hash(const State state) {
     return state_hash_val;
 }
 
-// Precomputed tables
-
 static const State neighbors_mask[9] = {
     0b000000000000000111000111000,  // 0
     0b000000000000111000111000111,  // 1
@@ -65,7 +63,6 @@ static const uint8_t symmetric_mult[64] = {
 
 static const uint64_t MOD = 1ULL << 30;
 
-// Masks for positions (using 3 bits per cell)
 #define MASK_0  (0x7)
 #define MASK_1  (0x7 << 3)
 #define MASK_2  (0x7 << 6)
@@ -75,8 +72,6 @@ static const uint64_t MOD = 1ULL << 30;
 #define MASK_6  (0x7 << 18)
 #define MASK_7  (0x7 << 21)
 #define MASK_8  (0x7 << 24)
-
-// Inline assembly functions for popcount and count-trailing-zeros
 
 static inline int asm_popcnt(uint32_t x) {
     int r;
@@ -90,14 +85,12 @@ static inline int asm_ctz(uint32_t x) {
     return r;
 }
 
-// Hash Table Implementation
-
 typedef struct {
     uint32_t max_size;
     uint32_t * __restrict keys;
-    uint64_t * __restrict table; // Lower 32 bits: state; Upper 32 bits: storage index
+    uint64_t * __restrict table;
     size_t count;
-    uint32_t * __restrict storage;  // Flat array storing Count values (groups of 8 per entry)
+    uint32_t * __restrict storage;
     uint32_t storage_capacity;
     uint32_t next_storage_index;
 } HashTable;
@@ -138,7 +131,6 @@ static inline void hash_table_insert(HashTable *ht, const State new_state, const
         fprintf(stderr, "Hash table is full\n");
         exit(1);
     }
-    // Use bitwise AND for modulo (max_size is a power of two)
     uint32_t hash = new_state & (ht->max_size - 1);
     while (ht->table[hash] != 0) {
         uint64_t pair = ht->table[hash];
@@ -191,15 +183,11 @@ static inline void swap_hash_table(HashTable *a, HashTable *b) {
     b->next_storage_index = temp_next;
 }
 
-// Global variables
-
 int max_depth;
 int current_depth;
 HashTable states_to_process;
 HashTable new_states_to_process;
 uint32_t final_sum = 0;
-
-// Game state construction and symmetry operations
 
 static inline State create_state(const char *state_str) {
     if (strlen(state_str) != 9) {
@@ -272,9 +260,6 @@ static inline void add_final_state(State new_state, const Count counts[8]) {
     }
 }
 
-// Note: The previous non-static forward declaration for insert_possible_move was removed 
-// to resolve the storage class conflict. Use the following static inline definition directly.
-
 static inline void insert_possible_move(State new_state, const Count counts[8]) {
     State canonical_state = new_state;
     int canonical_index = 0;
@@ -301,7 +286,6 @@ static inline void insert_possible_move(State new_state, const Count counts[8]) 
     }
 }
 
-// Compute a neighbor mask for the given position.
 static inline State get_neighbor_mask(State state, int position) {
     State mask = state & neighbors_mask[position];
     return ( !!(mask & 7) ) |
@@ -315,7 +299,6 @@ static inline State get_neighbor_mask(State state, int position) {
            ((!!((mask >> 24) & 7)) << 8);
 }
 
-// Generate all possible moves given a state and corresponding counts.
 void get_possible_moves(State state, const Count counts[8]) {
     for (int i = 0; i < 9; i++) {
         if (!IS_POSITION_EMPTY(state, i))
@@ -324,7 +307,6 @@ void get_possible_moves(State state, const Count counts[8]) {
         int neighbor_count = asm_popcnt(neighbor_mask);
         int capture_possible = 0;
 
-        // Macros for summing two or three neighboring dice values.
         #define two_sum(i0, n0, i1, n1)                              \
             do {                                                   \
                 int sum = (n0) + (n1);                             \
@@ -414,8 +396,6 @@ void get_possible_moves(State state, const Count counts[8]) {
 static inline int compute_final_sum() {
     return final_sum % MOD;
 }
-
-// Main function
 
 int main() {
     int i;
