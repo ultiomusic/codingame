@@ -64,6 +64,26 @@ const std::array<uint8_t, 64> symmetric_mult = {
 
 constexpr uint64_t MOD = 1ULL << 30;
 
+//
+// A helper to compute all eight symmetric transformations for a given state.
+// These transformations are exactly the same as those in your original get_symmetric_state.
+inline void compute_symmetries(State s, State sym[8]) {
+    sym[0] = s;
+    sym[1] = (((s & MASK_ROW_2) >> 18) | ((s & MASK_ROW_0) << 18) | (s & MASK_ROW_1));
+    sym[2] = (((s & MASK_COL_0) << 6) | ((s & MASK_COL_2) >> 6) | (s & MASK_COL_1));
+    { State tmp = sym[1];
+      sym[3] = (((tmp & MASK_COL_0) << 6) | ((tmp & MASK_COL_2) >> 6) | (tmp & MASK_COL_1)); }
+    sym[4] = ((s & (MASK_0|MASK_4|MASK_8)) | (((s) & (MASK_1|MASK_5)) << 6) |
+              (((s) & MASK_2) << 12) | (((s) & MASK_6) >> 12) | (((s) & (MASK_3|MASK_7)) >> 6));
+    { State tmp = sym[4];
+      sym[5] = (((tmp & MASK_ROW_2) >> 18) | ((tmp & MASK_ROW_0) << 18) | (tmp & MASK_ROW_1)); }
+    sym[6] = (((s & (MASK_0|MASK_5)) << 6) | ((s & MASK_1) << 12) | ((s & MASK_2) << 18) |
+              (((s) & (MASK_3|MASK_8)) >> 6) | (s & MASK_4) | (((s)&MASK_6)>>18) | (((s)&MASK_7)>>12));
+    sym[7] = (((s & MASK_0) << 24) | (((s)&(MASK_1|MASK_3)) << 12) | (s & (MASK_2|MASK_4|MASK_6)) |
+              (((s)&(MASK_5|MASK_7)) >> 12) | (((s)&MASK_8)>>24));
+}
+
+// --- HashTable (unchanged) ---
 struct HashTable {
     const uint32_t max_size = 100000;
     uint32_t *keys;
@@ -96,7 +116,7 @@ struct HashTable {
     HashTable(HashTable&&) = delete;
     HashTable& operator=(HashTable&&) = delete;
 
-    void insert(const State& new_state, const CountArray& value) {
+    inline void insert(const State& new_state, const CountArray& value) {
         uint32_t hash = new_state % max_size;
         while (table[hash] != 0) {
             const uint64_t pair = table[hash];
@@ -119,7 +139,7 @@ struct HashTable {
         count++;
     }
 
-    uint32_t get_next_storage_index() {
+    inline uint32_t get_next_storage_index() {
         if (next_storage_index + 8 > storage_capacity) {
             storage_capacity *= 2;
             uint32_t* new_storage = new uint32_t[storage_capacity];
@@ -132,14 +152,14 @@ struct HashTable {
         return index;
     }
 
-    void clear() {
+    inline void clear() {
         memset(table, 0, max_size * sizeof(uint64_t));
         count = 0;
         next_storage_index = 0;
     }
 };
 
-void swap_hash_table(HashTable& a, HashTable& b) {
+inline void swap_hash_table(HashTable &a, HashTable &b) {
     std::swap(a.keys, b.keys);
     std::swap(a.table, b.table);
     std::swap(a.storage, b.storage);
@@ -148,116 +168,56 @@ void swap_hash_table(HashTable& a, HashTable& b) {
     std::swap(a.next_storage_index, b.next_storage_index);
 }
 
+// --- Global Variables ---
 int max_depth;
 int current_depth;
 HashTable states_to_process;
 HashTable new_states_to_process;
 uint32_t final_sum = 0;
 
-State create_state(const char * state_str) {
-    State state = 0;
-    for (int i = 0; i < 9; i++) {
-        state = SET_DIE_VALUE(state, i, state_str[i] - '0');
-    }
-    return state;
-}
-
-State get_symmetric_state(const State state, const int symmetry) {
-    #define VERTCAL_FLIP(state) (((state) & MASK_ROW_2) >> 18) | (((state) & MASK_ROW_0) << 18) | ((state) & MASK_ROW_1)
-    #define HORIZONTAL_FLIP(state) (((state) & MASK_COL_0) << 6) | (((state) & MASK_COL_2) >> 6) | ((state) & MASK_COL_1)
-    #define VH_FLIP(state) \
-        (((state) & (MASK_0)) << 24) | (((state) & (MASK_1)) << 18) | (((state) & (MASK_2)) << 12) | \
-        (((state) & (MASK_3)) << 6) | ((state) & (MASK_4)) | (((state) & (MASK_5)) >> 6) | \
-        (((state) & (MASK_6)) >> 12) | (((state) & (MASK_7)) >> 18) | (((state) & (MASK_8)) >> 24)
-    #define DIAGONAL_FLIP(state) \
-        ((state) & (MASK_0 | MASK_4 | MASK_8)) | (((state) & (MASK_1 | MASK_5)) << 6) | \
-        (((state) & MASK_2) << 12) | (((state) & MASK_6) >> 12) | (((state) & (MASK_3 | MASK_7)) >> 6)
-
-    #define DV_FLIP(state) \
-        (((state) & MASK_0) << 18) | (((state) & (MASK_1 | MASK_6)) << 6) | (((state) & (MASK_2 | MASK_7)) >> 6) | \
-        (((state) & MASK_3) << 12) | ((state) & MASK_4) | (((state) & (MASK_5)) >> 12) | (((state) & MASK_8) >> 18)
-
-    #define DH_FLIP(state) \
-        (((state) & (MASK_0 | MASK_5)) << 6) | (((state) & MASK_1) << 12) | (((state) & MASK_2) << 18) | \
-        (((state) & (MASK_3 | MASK_8)) >> 6) | ((state) & MASK_4) | (((state) & MASK_6) >> 18) | (((state) & MASK_7) >> 12)
-
-    #define DVH_FLIP(state) \
-        (((state) & MASK_0) << 24) | (((state) & (MASK_1 | MASK_3)) << 12) | ((state) & (MASK_2 | MASK_4 | MASK_6)) | \
-        (((state) & (MASK_5 | MASK_7)) >> 12) | (((state) & MASK_8) >> 24)
-
-    switch (symmetry)
-    {
-        case 0:
-            return state;
-        case 1:
-            return VERTCAL_FLIP(state);
-        case 2:
-            return HORIZONTAL_FLIP(state);
-        case 3:
-            { const State v = VERTCAL_FLIP(state); return HORIZONTAL_FLIP(v); }
-        case 4:
-            return DIAGONAL_FLIP(state);
-        case 5:
-            { const State v = DIAGONAL_FLIP(state); return VERTCAL_FLIP(v); }
-        case 6:
-            return DH_FLIP(state);
-        case 7:
-            return DVH_FLIP(state);
-    }
-    return state;
-}
-
-void add_final_state(const State new_state, const CountArray & counts)
-{
-    for (int symmetry = 0; symmetry < 8; symmetry++)
-    {
-        if (counts[symmetry] == 0)
+// --- Symmetry Functions using caching via compute_symmetries ---
+// Instead of calling get_symmetric_state repeatedly, we compute and cache all 8 symmetric forms at once.
+inline void add_final_state(const State new_state, const CountArray &counts) {
+    State sym[8];
+    compute_symmetries(new_state, sym);
+    for (int i = 0; i < 8; i++) {
+        if (counts[i] == 0)
             continue;
-        const State symmetric_state = get_symmetric_state(new_state, symmetry);
         int hash = 0;
-        for (int i = 0; i < 9; i++)
-        {
-            hash = hash * 10 + GET_DIE_VALUE(symmetric_state, i);
+        for (int j = 0; j < 9; j++) {
+            hash = hash * 10 + GET_DIE_VALUE(sym[i], j);
         }
-        final_sum += hash * counts[symmetry];
+        final_sum += hash * counts[i];
     }
 }
 
-void insert_possible_move(const State new_state, const Count * const counts)
-{
-    State canonical_state = new_state;
+void insert_possible_move(const State new_state, const Count *const counts) {
+    State sym[8];
+    compute_symmetries(new_state, sym);
+    State canonical_state = sym[0];
     int canonical_index = 0;
-    for (int i = 1; i < 8; i++)
-    {
-        const State symmetric_state = get_symmetric_state(new_state, i);
-        if (symmetric_state < canonical_state)
-        {
+    for (int i = 1; i < 8; i++) {
+        if (sym[i] < canonical_state) {
+            canonical_state = sym[i];
             canonical_index = i;
-            canonical_state = symmetric_state;
         }
     }
-
     CountArray new_counts;
-    for (int symmetry = 0; symmetry < 8; symmetry++)
-    {
-        new_counts[symmetry] = counts[symmetric_mult[canonical_index * 8 + symmetry]];
+    for (int i = 0; i < 8; i++) {
+        new_counts[i] = counts[symmetric_mult[canonical_index * 8 + i]];
     }
-
     if ((current_depth == max_depth - 1) ||
         ((canonical_state & MASK_0) && (canonical_state & MASK_1) && (canonical_state & MASK_2) &&
          (canonical_state & MASK_3) && (canonical_state & MASK_4) && (canonical_state & MASK_5) &&
-         (canonical_state & MASK_6) && (canonical_state & MASK_7) && (canonical_state & MASK_8)))
-    {
+         (canonical_state & MASK_6) && (canonical_state & MASK_7) && (canonical_state & MASK_8))) {
         add_final_state(canonical_state, new_counts);
-    }
-    else
-    {
+    } else {
         new_states_to_process.insert(canonical_state, new_counts);
     }
 }
 
-State get_neighbor_mask(const State state, const int position)
-{
+// --- get_possible_moves (unchanged from original) ---
+State get_neighbor_mask(const State state, const int position) {
     const State mask = state & neighbors_mask[position];
     return ( (!!(mask & 0b111)) |
              ((!!((mask >> 3) & 0b111)) << 1) |
@@ -270,10 +230,8 @@ State get_neighbor_mask(const State state, const int position)
              ((!!((mask >> 24) & 0b111)) << 8) );
 }
 
-void get_possible_moves(const State state, const Count * const counts)
-{
-    for (int i = 0; i < 9; i++)
-    {
+void get_possible_moves(const State state, const Count *const counts) {
+    for (int i = 0; i < 9; i++) {
         if (!IS_POSITION_EMPTY(state, i))
             continue;
         
@@ -284,8 +242,7 @@ void get_possible_moves(const State state, const Count * const counts)
 #define two_sum(i0, n0, i1, n1) \
         { \
             const int sum = n0 + n1; \
-            if (sum <= 6) \
-            { \
+            if (sum <= 6) { \
                 State new_state = CLEAR_DIE_VALUE(state, i0); \
                 new_state = CLEAR_DIE_VALUE(new_state, i1); \
                 new_state = SET_DIE_VALUE(new_state, i, sum); \
@@ -297,8 +254,7 @@ void get_possible_moves(const State state, const Count * const counts)
 #define three_sum(i0, n0, i1, n1, i2, n2) \
         { \
             const int sum = n0 + n1 + n2; \
-            if (sum <= 6) \
-            { \
+            if (sum <= 6) { \
                 State new_state = CLEAR_DIE_VALUE(state, i0); \
                 new_state = CLEAR_DIE_VALUE(new_state, i1); \
                 new_state = CLEAR_DIE_VALUE(new_state, i2); \
@@ -308,16 +264,14 @@ void get_possible_moves(const State state, const Count * const counts)
             } \
         }
 
-        if (neighbor_count == 2)
-        {
+        if (neighbor_count == 2) {
             const int first_neighbor_index = __builtin_ctzll(neighbor_mask);
             const int second_neighbor_index = __builtin_ctzll(neighbor_mask & ~(1 << first_neighbor_index));
             const int first_die_value = GET_DIE_VALUE(state, first_neighbor_index);
             const int second_die_value = GET_DIE_VALUE(state, second_neighbor_index);
             two_sum(first_neighbor_index, first_die_value, second_neighbor_index, second_die_value);
         }
-        else if (neighbor_count == 3)
-        {
+        else if (neighbor_count == 3) {
             const int first_neighbor_index = __builtin_ctzll(neighbor_mask);
             const int second_neighbor_index = __builtin_ctzll(neighbor_mask & ~(1 << first_neighbor_index));
             const int third_neighbor_index = __builtin_ctzll(neighbor_mask & ~(1 << first_neighbor_index) & ~(1 << second_neighbor_index));
@@ -329,8 +283,7 @@ void get_possible_moves(const State state, const Count * const counts)
             two_sum(second_neighbor_index, second_die_value, third_neighbor_index, third_die_value);
             three_sum(first_neighbor_index, first_die_value, second_neighbor_index, second_die_value, third_neighbor_index, third_die_value);
         }
-        else if (neighbor_count == 4)
-        {
+        else if (neighbor_count == 4) {
             const int first_neighbor_index = __builtin_ctzll(neighbor_mask);
             const int second_neighbor_index = __builtin_ctzll(neighbor_mask & ~(1 << first_neighbor_index));
             const int third_neighbor_index = __builtin_ctzll(neighbor_mask & ~(1 << first_neighbor_index) & ~(1 << second_neighbor_index));
@@ -350,8 +303,7 @@ void get_possible_moves(const State state, const Count * const counts)
             three_sum(first_neighbor_index, first_die_value, third_neighbor_index, third_die_value, fourth_neighbor_index, fourth_die_value);
             three_sum(second_neighbor_index, second_die_value, third_neighbor_index, third_die_value, fourth_neighbor_index, fourth_die_value);
             const int sum = first_die_value + second_die_value + third_die_value + fourth_die_value;
-            if (sum <= 6)
-            {
+            if (sum <= 6) {
                 State new_state = CLEAR_DIE_VALUE(state, first_neighbor_index);
                 new_state = CLEAR_DIE_VALUE(new_state, second_neighbor_index);
                 new_state = CLEAR_DIE_VALUE(new_state, third_neighbor_index);
@@ -362,25 +314,24 @@ void get_possible_moves(const State state, const Count * const counts)
             }
         }
 
-        if (neighbor_count < 2 || !capture_possible)
-        {
+        if (neighbor_count < 2 || !capture_possible) {
             insert_possible_move(SET_DIE_VALUE(state, i, 1), counts);
         }
     }
 }
 
-int compute_final_sum()
-{
+int compute_final_sum() {
     return final_sum % MOD;
 }
 
-int main()
-{
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
     std::cin >> max_depth; std::cin.ignore();
     
     State initial_state = 0;
-    for (int i = 0; i < 9; i++)
-    {
+    for (int i = 0; i < 9; i++) {
         State value;
         std::cin >> value; std::cin.ignore();
         initial_state = SET_DIE_VALUE(initial_state, i, value);
@@ -392,13 +343,11 @@ int main()
     states_to_process.insert(initial_state, initial_counts);
 
     int iteration = 0;
-    for (current_depth = 0; current_depth < max_depth; current_depth++)
-    {
+    for (current_depth = 0; current_depth < max_depth; current_depth++) {
         if (states_to_process.count == 0)
             break;
         
-        for (uint32_t i = 0; i < states_to_process.count; i++)
-        {
+        for (uint32_t i = 0; i < states_to_process.count; i++) {
             const uint32_t table_index = states_to_process.keys[i];
             const uint64_t pair = states_to_process.table[table_index];
             const State state = pair & 0xFFFFFFFF;
