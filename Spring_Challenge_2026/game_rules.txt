@@ -1,0 +1,115 @@
+ 	The Goal
+You control a pack of trolls. Make them collect the most resources.
+ 	Rules
+Each player starts with a shack and a troll. Control your troll to collect fruits , mine iron and chop trees and then bring the resources back to your shack. The resources can be used to train more trolls or plant trees. The game is played on a grid, cells have different terrains and trees on them.
+
+Troll attributes
+Each troll has 4 attributes: movementSpeed, carryCapacity, harvestPower and chopPower. They can't be changed.
+
+Trees
+A tree has a type (PLUM, LEMON, APPLE, BANANA), a size, a health, an amount of fruits and a cooldown. When cooldown reaches 0, the tree either grows in size or, if at maximum size (4), produces fruits. Trees can hold up to 3 fruits.
+
+Trees grow faster when next to water.
+
+
+Trees differ in cooldown and health as follows:
+PLUM	LEMON	APPLE	BANANA
+Cooldown	8	8	9	6
+Cooldown near water	3	3	2	4
+Health (size 1)	6	6	11	3
+Health (size 2)	8	8	14	4
+Health (size 3)	10	10	17	5
+Health (size 4)	12	12	20	6
+When a damaged tree grows, it gains the health difference between sizes.
+
+Moving units
+Each troll has a movementSpeed determining how many cells it can MOVE horizontally or vertically per turn. Each cell can hold at most 1 troll per team. Only GRASS cells are walkable. The shack is also the spawn point, but trolls can't walk back on that cell after leaving it. If the target is out of range or not walkable, the troll moves to the nearest reachable cell towards it.
+
+Harvesting
+Trees can be harvested, given they have fruits on them. When a troll shares a cell with a tree, HARVEST will take as many fruits as possible by free carryCapacity and harvestPower. When two trolls harvest the same tree in parallel, they keep taking one fruit at a time, as long as there are fruits left and they can still harvest. The last fruit can get duplicated, so that both trolls can have it.
+
+Planting trees
+A troll can PLANT a tree on its current cell if the troll carries at least 1 fruit of that type. If two trolls try to plant a tree of the same type on the same cell, both will lose a seed and the tree gets planted. If they try to plant different types, nothing will happen.
+
+Chopping trees
+A troll can CHOP a tree on the same cell, reducing its health by chopPower. When health reaches 0, the tree disappears and the troll collects wood equal to its size, capped by free carryCapacity. Any wood that the troll can't carry will just vanish. Similar to harvesting, both trolls get one wood at a time until they can't carry any more or the wood is completely split up. The last wood can get duplicated.
+
+Mining
+A troll adjacent to an IRON cell can MINE, gaining up to chopPower iron limited by free carryCapacity. Iron resources are infinite.
+
+Dropping items
+When a troll carrying resources is next to its shack (horizontally or vertically), DROP transfers all carried items to the shack.
+
+Picking items
+A troll can PICK one item from its shack. Only 1 item can be picked at a time.
+
+Training trolls
+Use TRAIN to spawn a new troll at your shack and set its four attributes. Each attribute requires a different resource:
+PLUM for movementSpeed
+LEMON for carryCapacity
+APPLE for harvestPower
+IRON for chopPower
+The cost for each attribute is equal to the number of existing trolls in the own team plus the attribute squared.
+Example: you already have 2 trolls and want to TRAIN the following, giving you these costs:
+2 movementSpeed: 2 + 2×2 = 6 PLUMs
+3 carryCapacity: 2 + 3×3 = 11 LEMONs
+1 harvestPower: 2 + 1×1 = 3 APPLEs
+0 chopPower: 2 + 0×0 = 2 IRONs
+
+
+Victory Conditions
+You score more points than your opponent. Each fruit in your shack scores 1 point ; WOOD scores 4 points. IRON has no score value.
+Loss Conditions
+You have fewer points than your opponent.
+You fail to respond in time or output an unrecognized command.
+
+ 	Expert Rules
+Referee source code: https://github.com/eulerscheZahl/Troll-Farm
+Don't hesitate to change the viewer's options to help debug your code ().
+
+The game turn order is:
+Move trolls
+Harvest
+Plant
+Chop
+Pick
+Train
+Drop
+Mine
+Grow trees
+Actions of the same type occur simultaneously. If both teams harvest or chop the same tree at once, resources are shared equally.
+Then both get one item at a time until they can't carry any more or the resource is exhausted. The last item can get duplicated.
+Each troll can only perform one action per turn.
+ 	Game Input
+Initial input
+First line: width height, the grid size.
+Next height lines: each line has width characters: . for GRASS, ~ for WATER, # for ROCK, + for IRON, 0 for your own SHACK, 1 for your opponent's SHACK.
+
+
+Input for each game turn
+First two lines: your inventory followed by your opponent's inventory: plums, lemons, apples, bananas, iron, wood
+Next line: treeCount, the number of trees.
+Next treeCount lines: type x y size health fruits cooldown, where type can be PLUM, LEMON, APPLE, BANANA.
+Next line: trollsCount, the number of trolls.
+Next trollsCount lines: id player x y movementSpeed carryCapacity harvestPower chopPower carryPlum carryLemon carryApple carryBanana carryIron carryWood, where player is 0 if you own the troll, 1 otherwise.
+
+Output for one game turn
+Each turn you can print any number of commands, separated by ;.
+MOVE id x y Move troll id to cell (x, y).
+HARVEST id Make troll id harvest on its current cell.
+PLANT id type Make troll id plant a type on its current cell: PLUM, LEMON, APPLE or BANANA.
+CHOP id Make troll id chop on its current cell.
+PICK id type Make troll id pick one type from the shack: PLUM, LEMON, APPLE or BANANA.
+DROP id Make troll id drop all carried items at the shack.
+TRAIN moveSpeed carryCapacity harvestPower chopPower Train a new troll with the given attributes.
+MINE id Make troll id mine a nearby IRON.
+WAIT to do nothing.
+MSG text to display a message in the replay.
+Constraints
+
+Response time for the first turn ≤ 1000 ms
+Response time per turn ≤ 50 ms
+Note: you will only lose the game when you exceed the time limit 3 times by at most 50 ms or once by more than that. This is to counter random delays when servers are busy, it is not advised to intentionally exceed the limits.
+The game ends after 300 turns, when either player can enforce a win by doing nothing or when there are no trees on the map for 10 consecutive turns.
+8 ≤ height ≤ 11
+width = 2 * height
